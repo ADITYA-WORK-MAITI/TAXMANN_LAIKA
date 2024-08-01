@@ -61,8 +61,6 @@ urllib3==1.26.19
 uvicorn==0.30.1
 yarl==1.9.4
 PyPDF2==3.0.1
-logging==0.5.1.2
-concurrent.futures==3.1.2
 rank-bm25==0.2.2
 sklearn==0.0.post5
 pickle5==0.0.11
