@@ -34,6 +34,8 @@ from datetime import datetime
 from typing import List, Dict, Any
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from google.api_core.exceptions import ResourceExhausted
 
 # Setting up logging configuration 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -47,6 +49,8 @@ if not GOOGLE_API_KEY:
     raise ValueError("GOOGLE_API_KEY is required.")
 
 genai.configure(api_key=GOOGLE_API_KEY)
+
+MAX_CHUNK_SIZE = 10000  # Adjust this value based on the API's limits
 
 class EnhancedConversationalRAG:
     def __init__(self, vector_store, window_size=5):
@@ -104,33 +108,15 @@ class EnhancedConversationalRAG:
         
         return response.content
 
-JINA_READER_BASE_URL = "https://r.jina.ai/"
-
-def fetch_with_jina_reader(url):
-    try:
-        response = requests.get(f"{JINA_READER_BASE_URL}{url}")
-        response.raise_for_status()
-        return response.text
-    except requests.RequestException as e:
-        logger.error(f"Error fetching content with Jina Reader API: {str(e)}")
-        return None
-
 def get_pdf_text(pdf_docs):
     text = ""
     for pdf in pdf_docs:
         logger.info(f"Processing document: {pdf.name}")
         try:
-            if pdf.name.startswith('http'):
-                # Use Jina Reader API for web content
-                content = fetch_with_jina_reader(pdf.name)
-                if content:
-                    text += content
-            else:
-                # Process local PDF files as before
-                pdf_reader = PdfReader(pdf)
-                for i, page in enumerate(pdf_reader.pages):
-                    logger.info(f"Extracting text from page {i+1}")
-                    text += page.extract_text()
+            pdf_reader = PdfReader(pdf)
+            for i, page in enumerate(pdf_reader.pages):
+                logger.info(f"Extracting text from page {i+1}")
+                text += page.extract_text()
         except Exception as e:
             logger.error(f"Error processing document {pdf.name}: {str(e)}")
             raise
@@ -251,7 +237,6 @@ def wikipedia_search(question):
         logger.error(f"Wikipedia search error: {str(e)}")
         return None
 
-
 def generate_queries(original_query: str, num_queries: int = 3) -> List[str]:
     """Generate multiple queries based on the original query using Google's AI."""
     llm = ChatGoogleGenerativeAI(model="gemini-pro")
@@ -283,9 +268,6 @@ def rag_fusion_search(user_question: str, vector_store, num_queries: int = 3, to
     
     fused_results = reciprocal_rank_fusion(all_results)
     return [Document(page_content=doc) for doc, _ in fused_results[:top_k]]
-
-import traceback
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 def user_input(user_question):
     try:
@@ -386,27 +368,6 @@ def export_conversation():
         )
     else:
         st.warning("No conversation to export.")
-
-import time
-from tenacity import retry, stop_after_attempt, wait_exponential
-
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=4, max=60))
-def generate_summary_with_retry(text):
-    try:
-        return generate_summary(text)
-    except Exception as e:
-        if "429" in str(e) or "Resource has been exhausted" in str(e):
-            logger.warning(f"API rate limit hit. Retrying...")
-            raise
-        else:
-            logger.error(f"Error generating summary: {str(e)}")
-            raise
-
-import time
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from google.api_core.exceptions import ResourceExhausted
-
-MAX_CHUNK_SIZE = 10000  # Adjust this value based on the API's limits
 
 @retry(
     stop=stop_after_attempt(5),
@@ -511,30 +472,12 @@ def summary_page():
     st.subheader("Overall Summary")
     st.write(st.session_state.overall_summary)
     
-    if st.button("Back to Chat", use_container_width=True):
+    # Modified button with a unique key
+    if st.button("Back to Chat", use_container_width=True, key="summary_back_to_chat"):
         st.session_state.page = 'chat'
         st.rerun()
     
     st.markdown('</div>', unsafe_allow_html=True)
-
-def create_summary_pdf(summary, original_filename):
-    # Create a new PDF
-    pdf_filename = f"summary_{original_filename}"
-    c = canvas.Canvas(pdf_filename, pagesize=letter)
-    width, height = letter
-    
-    # Add content to the PDF
-    c.setFont("Helvetica", 12)
-    y = height - 40
-    
-    # Convert summary to string if it's not already
-    summary_text = str(summary)
-    
-    for line in summary_text.split('\n'):
-        c.drawString(40, y, line)
-        y -= 14
-    
-    c.save()
 
 def save_current_conversation():
     if st.session_state.conversation:
@@ -579,16 +522,6 @@ def show_faq():
        Click the "Clear Conversation" button in the sidebar to start fresh.
     """)
 
-def show_feedback_form():
-    st.markdown("### We Value Your Feedback!")
-    feedback = st.text_area("Please share your thoughts, suggestions, or report any issues:")
-    if st.button("Submit Feedback"):
-        if feedback:
-            st.success("Thank you for your feedback! We appreciate your input.")
-            # Here you would typically send this feedback to a database or email
-        else:
-            st.warning("Please enter some feedback before submitting.")
-
 def show_about_laika():
     st.markdown("""
     ### About Laika
@@ -608,15 +541,6 @@ def show_about_laika():
 
     For more information, please visit [TAXMANN's website](https://www.taxmann.com).
     """)
-
-def clear_uploaded_pdfs():
-    if st.session_state.pdf_docs:
-        st.session_state.pdf_docs = []
-        st.session_state.page = 'upload'
-        st.success("All uploaded documents have been cleared. You can now upload new documents or enter new URLs.")
-        st.rerun()
-    else:
-        st.warning("No documents are currently uploaded.")
 
 def upload_page():
     st.markdown('<div class="upload-page">', unsafe_allow_html=True)
@@ -670,27 +594,20 @@ def sidebar():
         
         st.markdown("---")
         
-        if st.button("Clear Conversation", use_container_width=True):
-            st.session_state.conversation = []
-            st.session_state.current_conversation = None
+        # Add the Back to Chat button here
+        if st.button("Back to Chat", use_container_width=True):
+            st.session_state.page = 'chat'
             st.rerun()
-        
-        if st.button("Export Conversation", use_container_width=True):
-            export_conversation()
         
         if st.button("Summarize Documents", use_container_width=True):
             summarize_documents()
         
-        if st.button("FAQ / Help", use_container_width=True):
-            st.session_state.page = 'faq'
-            st.rerun()
+        if st.button("Export Conversation", use_container_width=True):
+            export_conversation()
         
-        if st.button("Feedback", use_container_width=True):
-            st.session_state.page = 'feedback'
-            st.rerun()
-        
-        if st.button("About Laika", use_container_width=True):
-            st.session_state.page = 'about'
+        if st.button("Clear Conversation", use_container_width=True):
+            st.session_state.conversation = []
+            st.session_state.current_conversation = None
             st.rerun()
         
         if st.button("New Conversation", use_container_width=True):
@@ -701,8 +618,6 @@ def sidebar():
             st.success("Starting a new conversation. You can now upload new documents or enter new URLs.")
             st.rerun()
         
-        st.markdown("---")
-        
         if st.button("Save Current Conversation", use_container_width=True):
             save_current_conversation()
         
@@ -710,6 +625,14 @@ def sidebar():
         for conv_name in st.session_state.saved_conversations.keys():
             if st.button(conv_name, key=f"load_{conv_name}", use_container_width=True):
                 load_saved_conversation(conv_name)
+        
+        if st.button("FAQ / Help", use_container_width=True):
+            st.session_state.page = 'faq'
+            st.rerun()
+        
+        if st.button("About Laika", use_container_width=True):
+            st.session_state.page = 'about'
+            st.rerun()
 
 def chat_page():
     col1, col2 = st.columns([1, 1])
@@ -768,13 +691,13 @@ def main():
     @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&display=swap');
 
     body {
-        background-color: #F0FFF0;
+        background-color: #F5FFE0;
         color: #333333;
         font-family: 'Roboto', sans-serif;
     }
 
     .stApp {
-        background-color: #F0FFF0;
+        background-color: #F5FFE0;
     }
 
     .main-content, .chat-content {
@@ -787,7 +710,7 @@ def main():
         box-sizing: border-box;
         padding: 20px;
         overflow-y: auto;
-        background: linear-gradient(135deg, #F0FFF0, #FFFACD);
+        background: linear-gradient(135deg, #F5FFE0, #FAFFD1);
     }
 
     .stButton>button {
@@ -839,7 +762,7 @@ def main():
     }
 
     .stSelectbox>div>div>div {
-        background-color: #F0FFF0;
+        background-color: #F5FFE0;
         color: #333333;
         border: 2px solid #32CD32;
     }
@@ -890,7 +813,7 @@ def main():
     }
 
     .sidebar .sidebar-content {
-        background-color: #FFFACD;
+        background-color: #FAFFD1;
     }
 
     .logo-container {
@@ -907,8 +830,9 @@ def main():
 
     .logo-subtext {
         font-family: 'Roboto', sans-serif;
-        font-size: 18px;
+        font-size: 14px;
         color: #32CD32;
+        margin-top: -10px;
     }
 
     @keyframes gradientBG {
@@ -924,7 +848,7 @@ def main():
         left: 0;
         width: 100%;
         height: 100%;
-        background: linear-gradient(-45deg, #F0FFF0, #FFFACD, #90EE90, #FFFFE0);
+        background: linear-gradient(-45deg, #F5FFE0, #FAFFD1, #F0FFE0, #FFFDE7);
         background-size: 400% 400%;
         animation: gradientBG 15s ease infinite;
         z-index: -1;
@@ -958,10 +882,6 @@ def main():
     elif st.session_state.page == 'faq':
         st.markdown('<div class="main-content">', unsafe_allow_html=True)
         show_faq()
-        st.markdown('</div>', unsafe_allow_html=True)
-    elif st.session_state.page == 'feedback':
-        st.markdown('<div class="main-content">', unsafe_allow_html=True)
-        show_feedback_form()
         st.markdown('</div>', unsafe_allow_html=True)
     elif st.session_state.page == 'about':
         st.markdown('<div class="main-content">', unsafe_allow_html=True)
