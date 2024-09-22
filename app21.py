@@ -312,6 +312,10 @@ def handle_metadata_query(question):
         return "My name is Laika."
     elif "what can you do" in question:
         return "I can analyze PDF documents, answer questions based on their content, provide tax-related information, and assist with general queries about tax laws and regulations."
+     elif "what made you?" in question:
+        return "I was made by Aditya Maiti, an intern at Taxmann Technologies."
+     elif "what is Laika" in question:
+        return "I am Laika. I can chat with multiple pdfs."
     return None
 
 def export_conversation():
