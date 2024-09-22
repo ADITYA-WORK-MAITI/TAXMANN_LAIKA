@@ -1,3 +1,4 @@
+# app21.py
 import streamlit as st
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -6,8 +7,6 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 import google.generativeai as genai
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
 from dotenv import load_dotenv
 import base64
 import logging
@@ -17,22 +16,15 @@ from langchain_community.tools import DuckDuckGoSearchRun, WikipediaQueryRun
 from langchain_community.utilities import WikipediaAPIWrapper
 import traceback
 from rank_bm25 import BM25Okapi
-from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 import pickle
 from langchain.schema import Document
 from chatbot_prompts import get_conversational_chain
 import csv
 import io
-import requests
-import re
-from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import json
 from datetime import datetime
-from typing import List, Dict, Any
-import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from google.api_core.exceptions import ResourceExhausted
@@ -52,77 +44,28 @@ genai.configure(api_key=GOOGLE_API_KEY)
 
 MAX_CHUNK_SIZE = 10000  # Adjust this value based on the API's limits
 
-class EnhancedConversationalRAG:
-    def __init__(self, vector_store, window_size=5):
-        self.vector_store = vector_store
-        self.window_size = window_size
-        self.conversation_history = []
-        self.embeddings_history = []
-        self.embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        self.llm = ChatGoogleGenerativeAI(model="gemini-pro")
-
-    def add_to_history(self, message: str, is_user: bool):
-        self.conversation_history.append({"content": message, "is_user": is_user})
-        embedding = self.get_embedding(message)
-        self.embeddings_history.append(embedding)
-
-    def get_embedding(self, text: str) -> List[float]:
-        return self.embeddings.embed_query(text)
-
-    def get_relevant_history(self, query: str, top_k: int = 3) -> List[Dict]:
-        query_embedding = self.get_embedding(query)
-        similarities = cosine_similarity([query_embedding], self.embeddings_history)[0]
-        top_indices = np.argsort(similarities)[-top_k:][::-1]
-        return [self.conversation_history[i] for i in top_indices]
-
-    def process_query(self, query: str) -> str:
-        # Get relevant conversation history
-        relevant_history = self.get_relevant_history(query)
-        
-        # Construct prompt with conversation history
-        history_prompt = "\n".join([f"{'Human' if msg['is_user'] else 'Assistant'}: {msg['content']}" for msg in relevant_history])
-        
-        # Retrieve relevant documents
-        docs = self.vector_store.similarity_search(query, k=3)
-        
-        # Construct the full prompt
-        full_prompt = f"""
-        Conversation history:
-        {history_prompt}
-        
-        Human: {query}
-        
-        Relevant information:
-        {' '.join([doc.page_content for doc in docs])}
-        
-        Please provide a response based on the conversation history, the current question, and the relevant information provided.
-        
-        Assistant:"""
-        
-        # Generate response
-        response = self.llm.invoke(full_prompt)
-        
-        # Add query and response to history
-        self.add_to_history(query, is_user=True)
-        self.add_to_history(response.content, is_user=False)
-        
-        return response.content
-
 def get_pdf_text(pdf_docs):
     text = ""
     for pdf in pdf_docs:
-        logger.info(f"Processing document: {pdf.name}")
+        # Handle both string paths and file-like objects
+        pdf_name = os.path.basename(pdf) if isinstance(pdf, str) else pdf.name
+        logger.info(f"Processing document: {pdf_name}")
         try:
-            pdf_reader = PdfReader(pdf)
+            # If pdf is a string (file path), open it; otherwise, use it directly
+            pdf_file = open(pdf, 'rb') if isinstance(pdf, str) else pdf
+            pdf_reader = PdfReader(pdf_file)
             for i, page in enumerate(pdf_reader.pages):
                 logger.info(f"Extracting text from page {i+1}")
                 text += page.extract_text()
+            if isinstance(pdf, str):
+                pdf_file.close()
         except Exception as e:
-            logger.error(f"Error processing document {pdf.name}: {str(e)}")
+            logger.error(f"Error processing document {pdf_name}: {str(e)}")
             raise
     logger.info(f"Total extracted text length: {len(text)}")
     return text
 
+@st.cache_data(show_spinner=False)
 def get_text_chunks(text):
     try:
         text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
@@ -138,12 +81,14 @@ def create_bm25_index(text_chunks):
     bm25 = BM25Okapi(tokenized_corpus)
     return bm25
 
+@st.cache_data(show_spinner=False)
 def bm25_search(bm25, query, top_k=5):
     tokenized_query = query.split()
     doc_scores = bm25.get_scores(tokenized_query)
     top_doc_indices = np.argsort(doc_scores)[::-1][:top_k]
     return top_doc_indices, [doc_scores[i] for i in top_doc_indices]
 
+@st.cache_resource(show_spinner=False)
 def get_vector_store(text_chunks):
     try:
         logger.info(f"Creating vector store with {len(text_chunks)} chunks")
@@ -219,15 +164,6 @@ def search_pdf_content(question, context_docs):
         return answer
     return None
 
-def duckduckgo_search(question):
-    try:
-        search = DuckDuckGoSearchRun()
-        results = search.run(question)
-        return results
-    except Exception as e:
-        logger.error(f"DuckDuckGo search error: {str(e)}")
-        return None
-
 def wikipedia_search(question):
     try:
         wikipedia_tool = WikipediaQueryRun(api_wrapper=WikipediaAPIWrapper())
@@ -269,6 +205,12 @@ def rag_fusion_search(user_question: str, vector_store, num_queries: int = 3, to
     fused_results = reciprocal_rank_fusion(all_results)
     return [Document(page_content=doc) for doc, _ in fused_results[:top_k]]
 
+@st.cache_data(show_spinner=False)
+def compute_embedding(text: str) -> np.ndarray:
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    return embeddings.embed_query(text)
+
+# Modify the user_input function to include context maintenance
 def user_input(user_question):
     try:
         logger.info(f"Received question: {user_question}")
@@ -282,12 +224,33 @@ def user_input(user_question):
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
         new_db = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
 
+        # Compute embedding for the current question
+        current_embedding = compute_embedding(user_question)
+
+        # Find the most similar previous question
+        max_similarity = -1
+        most_similar_question = None
+        most_similar_response = None
+
+        for entry in st.session_state.conversation:
+            prev_embedding = compute_embedding(entry['question'])
+            similarity = cosine_similarity([current_embedding], [prev_embedding])[0][0]
+            if similarity > max_similarity:
+                max_similarity = similarity
+                most_similar_question = entry['question']
+                most_similar_response = entry['response']
+
+        # If a similar question is found, include it in the context
+        context = ""
+        if max_similarity > 0.8:  # You can adjust this threshold
+            context = f"Previously asked similar question: {most_similar_question}\nPrevious response: {most_similar_response}\n\n"
+
         # Use RAG Fusion for document retrieval
         context_docs = rag_fusion_search(user_question, new_db)
 
         # Perform enhanced search using a thread pool for timeout handling
         with ThreadPoolExecutor() as executor:
-            future = executor.submit(enhanced_search, user_question, context_docs)
+            future = executor.submit(enhanced_search, context + user_question, context_docs)
             try:
                 answer = future.result(timeout=30)
             except TimeoutError:
@@ -334,7 +297,6 @@ def post_process_answer(answer: str) -> str:
         refined_answer += '.'
 
     return refined_answer
-
 
 def handle_metadata_query(question):
     question = question.lower()
@@ -506,17 +468,17 @@ def show_faq():
     st.markdown("""
     ### Frequently Asked Questions
 
-    1. **How do I upload PDFs or enter URLs?**
-       Click on the "Upload New PDFs or Enter URLs" button in the sidebar and select your PDF files or enter URLs.
+    1. **How do I upload PDFs?**
+       Click on the "Upload New PDFs" button in the sidebar and select your PDF files or enter URLs.
 
     2. **What types of questions can I ask?**
-       You can ask questions related to the content of the uploaded PDFs/URLs or general tax-related queries.
+       You can ask questions related to the content of the uploaded PDFs or general tax-related queries.
 
     3. **How accurate are the responses?**
        Laika uses advanced AI to provide accurate information, but always verify important details with official sources.
 
-    4. **Can I upload multiple PDFs or URLs?**
-       Yes, you can upload multiple PDFs or enter multiple URLs at once.
+    4. **Can I upload multiple PDFs?**
+       Yes, you can upload multiple PDFs at once.
 
     5. **How do I start a new conversation?**
        Click the "Clear Conversation" button in the sidebar to start fresh.
@@ -553,7 +515,7 @@ def upload_page():
     
     st.markdown("<div style='height: 20px;'></div>", unsafe_allow_html=True)
            
-    uploaded_files = st.file_uploader("Upload your PDF files or enter URLs", accept_multiple_files=True, type=["pdf", "url"], label_visibility="collapsed")
+    uploaded_files = st.file_uploader("Upload your PDF files", accept_multiple_files=True, type=["pdf"], label_visibility="collapsed")
     if st.button("Process Documents", use_container_width=True):
         if uploaded_files:
             # Add new files to existing ones
@@ -569,7 +531,7 @@ def upload_page():
                     logger.error(f"Error processing documents: {str(e)}")
                     st.error("An error occurred while processing the documents. Please try again.")
         else:
-            st.warning("Please upload PDF files or enter URLs before processing.")
+            st.warning("Please upload PDF files before processing.")
     st.markdown('</div>', unsafe_allow_html=True)
 
 def sidebar():
@@ -583,18 +545,19 @@ def sidebar():
         
         st.markdown("---")
         
+        # Upload New PDFs button
         if st.button("Upload New PDFs", use_container_width=True):
             st.session_state.page = 'upload'
             st.rerun()
         
-        if st.session_state.page == 'chat':
+        # Display current PDFs
+        if st.session_state.pdf_docs:
             st.markdown("### Uploaded PDFs")
             for pdf in st.session_state.pdf_docs:
                 st.write(f"- {pdf.name}")
+            st.markdown("---")
         
-        st.markdown("---")
-        
-        # Add the Back to Chat button here
+        # Main action buttons
         if st.button("Back to Chat", use_container_width=True):
             st.session_state.page = 'chat'
             st.rerun()
@@ -615,17 +578,23 @@ def sidebar():
             st.session_state.conversation = []
             st.session_state.current_conversation = None
             st.session_state.page = 'upload'
-            st.success("Starting a new conversation. You can now upload new documents or enter new URLs.")
+            st.success("Starting a new conversation. You can now upload new documents.")
             st.rerun()
         
         if st.button("Save Current Conversation", use_container_width=True):
             save_current_conversation()
         
-        st.markdown("### Saved Conversations")
-        for conv_name in st.session_state.saved_conversations.keys():
-            if st.button(conv_name, key=f"load_{conv_name}", use_container_width=True):
-                load_saved_conversation(conv_name)
+        st.markdown("---")
         
+        # Saved Conversations in an expander
+        with st.expander("Saved Conversations"):
+            for conv_name in st.session_state.saved_conversations.keys():
+                if st.button(conv_name, key=f"load_{conv_name}", use_container_width=True):
+                    load_saved_conversation(conv_name)
+        
+        st.markdown("---")
+        
+        # Help and About buttons
         if st.button("FAQ / Help", use_container_width=True):
             st.session_state.page = 'faq'
             st.rerun()
@@ -633,6 +602,8 @@ def sidebar():
         if st.button("About Laika", use_container_width=True):
             st.session_state.page = 'about'
             st.rerun()
+        
+        
 
 def chat_page():
     col1, col2 = st.columns([1, 1])
