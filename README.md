@@ -6,6 +6,8 @@ Laika is a chat assistant for PDF documents. You upload tax or legal documents a
 
 It is built with Streamlit, Google Gemini, FAISS and BM25.
 
+I built Laika during my internship at [Taxmann](https://www.taxmann.com), a publisher of tax and legal content in India. This is why the interface carries the Taxmann name.
+
 ## Features
 
 - Questions and answers over one or more uploaded PDFs.
